@@ -118,6 +118,15 @@ static void macio_common_realize(PCIDevice *d, Error **errp)
     memory_region_add_subregion(&s->bar, 0x08000,
                                 sysbus_mmio_get_region(sysbus_dev, 0));
 
+    object_property_set_bool(OBJECT(&s->screamer), true, "realized", &err);
+    if (err) {
+        error_propagate(errp, err);
+        return;
+    }
+    sysbus_dev = SYS_BUS_DEVICE(&s->screamer);
+    memory_region_add_subregion(&s->bar, 0x14000,
+                                sysbus_mmio_get_region(sysbus_dev, 0));
+
     qdev_prop_set_uint32(DEVICE(&s->escc), "disabled", 0);
     qdev_prop_set_uint32(DEVICE(&s->escc), "frequency", ESCC_CLOCK);
     qdev_prop_set_uint32(DEVICE(&s->escc), "it_shift", 4);
@@ -130,7 +139,6 @@ static void macio_common_realize(PCIDevice *d, Error **errp)
         error_propagate(errp, err);
         return;
     }
-
     macio_bar_setup(s);
     pci_register_bar(d, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
 }
@@ -217,6 +225,13 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
         error_propagate(errp, err);
         return;
     }
+    
+    /* Screamer */
+    sysbus_dev = SYS_BUS_DEVICE(&s->screamer);
+    sysbus_connect_irq(sysbus_dev, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_TX_IRQ));
+    sysbus_connect_irq(sysbus_dev, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_TX_DMA_IRQ));
+    sysbus_connect_irq(sysbus_dev, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_RX_IRQ));
+    macio_screamer_register_dma(SCREAMER(sysbus_dev), &s->dbdma, 0x10, 0x12);
 }
 
 static void macio_init_ide(MacIOState *s, MACIOIDEState *ide, size_t ide_size,
@@ -386,6 +401,13 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
         memory_region_add_subregion(&s->bar, 0x16000,
                                     sysbus_mmio_get_region(sysbus_dev, 0));
     }
+
+    /* Screamer */
+    sysbus_dev = SYS_BUS_DEVICE(&s->screamer);
+    sysbus_connect_irq(sysbus_dev, 0, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_IRQ));
+    sysbus_connect_irq(sysbus_dev, 1, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_DMA_IRQ));
+    sysbus_connect_irq(sysbus_dev, 2, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_RX_IRQ));
+    macio_screamer_register_dma(SCREAMER(sysbus_dev), &s->dbdma, 0x10, 0x12);
 }
 
 static void macio_newworld_init(Object *obj)
@@ -420,6 +442,9 @@ static void macio_instance_init(Object *obj)
                          TYPE_MAC_DBDMA);
 
     macio_init_child_obj(s, "escc", &s->escc, sizeof(s->escc), TYPE_ESCC);
+    
+    macio_init_child_obj(s, "screamer", &s->screamer, sizeof(s->screamer),
+                         TYPE_SCREAMER);
 }
 
 static const VMStateDescription vmstate_macio_oldworld = {
