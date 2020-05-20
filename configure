@@ -4932,7 +4932,7 @@ fi
 # If we're making warnings fatal, apply this to Sphinx runs as well
 sphinx_werror=""
 if test "$werror" = "yes"; then
-    sphinx_werror="-W"
+    sphinx_werror=""
 fi
 
 # Check we have a new enough version of sphinx-build
