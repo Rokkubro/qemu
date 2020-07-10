@@ -43,7 +43,6 @@
 #include "hw/qdev-properties.h"
 #include "hw/s390x/tod.h"
 #include "sysemu/sysemu.h"
-#include "sysemu/balloon.h"
 #include "hw/s390x/pv.h"
 #include "migration/blocker.h"
 
@@ -75,7 +74,7 @@ static S390CPU *s390x_new_cpu(const char *typename, uint32_t core_id,
     if (err != NULL) {
         goto out;
     }
-    object_property_set_bool(OBJECT(cpu), true, "realized", &err);
+    qdev_realize(DEVICE(cpu), NULL, &err);
 
 out:
     object_unref(OBJECT(cpu));
@@ -210,7 +209,7 @@ static void s390_init_ipl_dev(const char *kernel_filename,
     object_property_add_child(qdev_get_machine(), TYPE_S390_IPL,
                               new);
     object_unref(new);
-    qdev_init_nofail(dev);
+    qdev_realize(dev, NULL, &error_fatal);
 }
 
 static void s390_create_virtio_net(BusState *bus, const char *name)
@@ -227,9 +226,9 @@ static void s390_create_virtio_net(BusState *bus, const char *name)
 
         qemu_check_nic_model(nd, "virtio");
 
-        dev = qdev_create(bus, name);
+        dev = qdev_new(name);
         qdev_set_nic_properties(dev, nd);
-        qdev_init_nofail(dev);
+        qdev_realize_and_unref(dev, bus, &error_fatal);
     }
 }
 
@@ -237,9 +236,9 @@ static void s390_create_sclpconsole(const char *type, Chardev *chardev)
 {
     DeviceState *dev;
 
-    dev = qdev_create(sclp_get_event_facility_bus(), type);
+    dev = qdev_new(type);
     qdev_prop_set_chr(dev, "chardev", chardev);
-    qdev_init_nofail(dev);
+    qdev_realize_and_unref(dev, sclp_get_event_facility_bus(), &error_fatal);
 }
 
 static void ccw_init(MachineState *machine)
@@ -269,10 +268,10 @@ static void ccw_init(MachineState *machine)
                       machine->initrd_filename, "s390-ccw.img",
                       "s390-netboot.img", true);
 
-    dev = qdev_create(NULL, TYPE_S390_PCI_HOST_BRIDGE);
+    dev = qdev_new(TYPE_S390_PCI_HOST_BRIDGE);
     object_property_add_child(qdev_get_machine(), TYPE_S390_PCI_HOST_BRIDGE,
                               OBJECT(dev));
-    qdev_init_nofail(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
 
     /* register hypercalls */
     virtio_ccw_register_hcalls();
@@ -329,7 +328,7 @@ static void s390_machine_unprotect(S390CcwMachineState *ms)
     ms->pv = false;
     migrate_del_blocker(pv_mig_blocker);
     error_free_or_abort(&pv_mig_blocker);
-    qemu_balloon_inhibit(false);
+    ram_block_discard_disable(false);
 }
 
 static int s390_machine_protect(S390CcwMachineState *ms)
@@ -338,17 +337,22 @@ static int s390_machine_protect(S390CcwMachineState *ms)
     int rc;
 
    /*
-    * Ballooning on protected VMs needs support in the guest for
-    * sharing and unsharing balloon pages. Block ballooning for
-    * now, until we have a solution to make at least Linux guests
-    * either support it or fail gracefully.
+    * Discarding of memory in RAM blocks does not work as expected with
+    * protected VMs. Sharing and unsharing pages would be required. Disable
+    * it for now, until until we have a solution to make at least Linux
+    * guests either support it (e.g., virtio-balloon) or fail gracefully.
     */
-    qemu_balloon_inhibit(true);
+    rc = ram_block_discard_disable(true);
+    if (rc) {
+        error_report("protected VMs: cannot disable RAM discard");
+        return rc;
+    }
+
     error_setg(&pv_mig_blocker,
                "protected VMs are currently not migrateable.");
     rc = migrate_add_blocker(pv_mig_blocker, &local_err);
     if (rc) {
-        qemu_balloon_inhibit(false);
+        ram_block_discard_disable(false);
         error_report_err(local_err);
         error_free_or_abort(&pv_mig_blocker);
         return rc;
@@ -357,7 +361,7 @@ static int s390_machine_protect(S390CcwMachineState *ms)
     /* Create SE VM */
     rc = s390_pv_vm_enable();
     if (rc) {
-        qemu_balloon_inhibit(false);
+        ram_block_discard_disable(false);
         migrate_del_blocker(pv_mig_blocker);
         error_free_or_abort(&pv_mig_blocker);
         return rc;
@@ -401,7 +405,7 @@ static void s390_pv_prepare_reset(S390CcwMachineState *ms)
         s390_cpu_set_state(S390_CPU_STATE_STOPPED, S390_CPU(cs));
     }
     s390_pv_unshare();
-    s390_pv_perf_clear_reset();
+    s390_pv_prep_reset();
 }
 
 static void s390_machine_reset(MachineState *machine)

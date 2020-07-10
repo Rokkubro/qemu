@@ -567,7 +567,7 @@ SpaprDrc *spapr_dr_connector_new(Object *owner, const char *type,
                                 spapr_drc_index(drc));
     object_property_add_child(owner, prop_name, OBJECT(drc));
     object_unref(OBJECT(drc));
-    object_property_set_bool(OBJECT(drc), true, "realized", NULL);
+    qdev_realize(DEVICE(drc), NULL, NULL);
     g_free(prop_name);
 
     return drc;
@@ -1163,16 +1163,14 @@ static void rtas_ibm_configure_connector(PowerPCCPU *cpu,
     drck = SPAPR_DR_CONNECTOR_GET_CLASS(drc);
 
     if (!drc->fdt) {
-        Error *local_err = NULL;
         void *fdt;
         int fdt_size;
 
         fdt = create_device_tree(&fdt_size);
 
         if (drck->dt_populate(drc, spapr, fdt, &drc->fdt_start_offset,
-                              &local_err)) {
+                              NULL)) {
             g_free(fdt);
-            error_free(local_err);
             rc = SPAPR_DR_CC_RESPONSE_ERROR;
             goto out;
         }
