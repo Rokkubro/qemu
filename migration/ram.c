@@ -859,9 +859,11 @@ static inline bool migration_bitmap_clear_dirty(RAMState *rs,
 /* Called with RCU critical section */
 static void ramblock_sync_dirty_bitmap(RAMState *rs, RAMBlock *rb)
 {
-    rs->migration_dirty_pages +=
-        cpu_physical_memory_sync_dirty_bitmap(rb, 0, rb->used_length,
-                                              &rs->num_dirty_pages_period);
+    uint64_t new_dirty_pages =
+        cpu_physical_memory_sync_dirty_bitmap(rb, 0, rb->used_length);
+
+    rs->migration_dirty_pages += new_dirty_pages;
+    rs->num_dirty_pages_period += new_dirty_pages;
 }
 
 /**
@@ -913,10 +915,8 @@ static void migration_update_rates(RAMState *rs, int64_t end_time)
         unencoded_size = (xbzrle_counters.pages - rs->xbzrle_pages_prev) *
                          TARGET_PAGE_SIZE;
         encoded_size = xbzrle_counters.bytes - rs->xbzrle_bytes_prev;
-        if (xbzrle_counters.pages == rs->xbzrle_pages_prev) {
+        if (xbzrle_counters.pages == rs->xbzrle_pages_prev || !encoded_size) {
             xbzrle_counters.encoding_rate = 0;
-        } else if (!encoded_size) {
-            xbzrle_counters.encoding_rate = UINT64_MAX;
         } else {
             xbzrle_counters.encoding_rate = unencoded_size / encoded_size;
         }
@@ -3360,7 +3360,7 @@ static bool postcopy_is_running(void)
  * Flush content of RAM cache into SVM's memory.
  * Only flush the pages that be dirtied by PVM or SVM or both.
  */
-static void colo_flush_ram_cache(void)
+void colo_flush_ram_cache(void)
 {
     RAMBlock *block = NULL;
     void *dst_host;
@@ -3632,9 +3632,6 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
     }
     trace_ram_load_complete(ret, seq_iter);
 
-    if (!ret  && migration_incoming_in_colo_state()) {
-        colo_flush_ram_cache();
-    }
     return ret;
 }
 

@@ -1587,8 +1587,7 @@ static void spapr_pci_unplug(HotplugHandler *plug_handler,
         return;
     }
 
-    object_property_set_bool(OBJECT(plugged_dev), false, "realized",
-                             &error_abort);
+    qdev_unrealize(plugged_dev);
 }
 
 static void spapr_pci_unplug_request(HotplugHandler *plug_handler,
@@ -1720,7 +1719,7 @@ static void spapr_phb_unrealize(DeviceState *dev)
     address_space_remove_listeners(&sphb->iommu_as);
     address_space_destroy(&sphb->iommu_as);
 
-    qbus_set_hotplug_handler(BUS(phb->bus), NULL, &error_abort);
+    qbus_set_hotplug_handler(BUS(phb->bus), NULL);
     pci_unregister_root_bus(phb->bus);
 
     memory_region_del_subregion(get_system_memory(), &sphb->iowindow);
@@ -1869,7 +1868,7 @@ static void spapr_phb_realize(DeviceState *dev, Error **errp)
         bus->flags |= PCI_BUS_EXTENDED_CONFIG_SPACE;
     }
     phb->bus = bus;
-    qbus_set_hotplug_handler(BUS(phb->bus), OBJECT(sphb), NULL);
+    qbus_set_hotplug_handler(BUS(phb->bus), OBJECT(sphb));
 
     /*
      * Initialize PHB address space.

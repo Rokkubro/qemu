@@ -78,6 +78,8 @@ enum {
     OPTION_ENABLE = 272,
     OPTION_DISABLE = 273,
     OPTION_MERGE = 274,
+    OPTION_BITMAPS = 275,
+    OPTION_FORCE = 276,
 };
 
 typedef enum OutputFormat {
@@ -191,6 +193,7 @@ static void QEMU_NORETURN help(void)
            "       hiding corruption that has already occurred.\n"
            "\n"
            "Parameters to convert subcommand:\n"
+           "  '--bitmaps' copies all top-level persistent bitmaps to destination\n"
            "  '-m' specifies how many coroutines work in parallel during the convert\n"
            "       process (defaults to 8)\n"
            "  '-W' allow to write to the target out of order rather than sequential\n"
@@ -1638,6 +1641,24 @@ out4:
     return ret;
 }
 
+/* Convenience wrapper around qmp_block_dirty_bitmap_merge */
+static void do_dirty_bitmap_merge(const char *dst_node, const char *dst_name,
+                                  const char *src_node, const char *src_name,
+                                  Error **errp)
+{
+    BlockDirtyBitmapMergeSource *merge_src;
+    BlockDirtyBitmapMergeSourceList *list;
+
+    merge_src = g_new0(BlockDirtyBitmapMergeSource, 1);
+    merge_src->type = QTYPE_QDICT;
+    merge_src->u.external.node = g_strdup(src_node);
+    merge_src->u.external.name = g_strdup(src_name);
+    list = g_new0(BlockDirtyBitmapMergeSourceList, 1);
+    list->value = merge_src;
+    qmp_block_dirty_bitmap_merge(dst_node, dst_name, list, errp);
+    qapi_free_BlockDirtyBitmapMergeSourceList(list);
+}
+
 enum ImgConvertBlockStatus {
     BLK_DATA,
     BLK_ZERO,
@@ -1660,7 +1681,6 @@ typedef struct ImgConvertState {
     BlockBackend *target;
     bool has_zero_init;
     bool compressed;
-    bool unallocated_blocks_are_zero;
     bool target_is_new;
     bool target_has_backing;
     int64_t target_backing_sectors; /* negative if unknown */
@@ -1705,7 +1725,7 @@ static int convert_iteration_sectors(ImgConvertState *s, int64_t sector_num)
 
     if (s->target_backing_sectors >= 0) {
         if (sector_num >= s->target_backing_sectors) {
-            post_backing_zero = s->unallocated_blocks_are_zero;
+            post_backing_zero = true;
         } else if (sector_num + n > s->target_backing_sectors) {
             /* Split requests around target_backing_sectors (because
              * starting from there, zeros are handled differently) */
@@ -2064,15 +2084,6 @@ static int convert_do_copy(ImgConvertState *s)
         s->has_zero_init = bdrv_has_zero_init(blk_bs(s->target));
     }
 
-    if (!s->has_zero_init && !s->target_has_backing &&
-        bdrv_can_write_zeroes_with_unmap(blk_bs(s->target)))
-    {
-        ret = blk_make_zero(s->target, BDRV_REQ_MAY_UNMAP | BDRV_REQ_NO_FALLBACK);
-        if (ret == 0) {
-            s->has_zero_init = true;
-        }
-    }
-
     /* Allocate buffer for copied data. For compressed images, only one cluster
      * can be copied at a time. */
     if (s->compressed) {
@@ -2121,6 +2132,39 @@ static int convert_do_copy(ImgConvertState *s)
     return s->ret;
 }
 
+static int convert_copy_bitmaps(BlockDriverState *src, BlockDriverState *dst)
+{
+    BdrvDirtyBitmap *bm;
+    Error *err = NULL;
+
+    FOR_EACH_DIRTY_BITMAP(src, bm) {
+        const char *name;
+
+        if (!bdrv_dirty_bitmap_get_persistence(bm)) {
+            continue;
+        }
+        name = bdrv_dirty_bitmap_name(bm);
+        qmp_block_dirty_bitmap_add(dst->node_name, name,
+                                   true, bdrv_dirty_bitmap_granularity(bm),
+                                   true, true,
+                                   true, !bdrv_dirty_bitmap_enabled(bm),
+                                   &err);
+        if (err) {
+            error_reportf_err(err, "Failed to create bitmap %s: ", name);
+            return -1;
+        }
+
+        do_dirty_bitmap_merge(dst->node_name, name, src->node_name, name,
+                              &err);
+        if (err) {
+            error_reportf_err(err, "Failed to populate bitmap %s: ", name);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 #define MAX_BUF_SECTORS 32768
 
 static int img_convert(int argc, char **argv)
@@ -2142,6 +2186,7 @@ static int img_convert(int argc, char **argv)
     int64_t ret = -EINVAL;
     bool force_share = false;
     bool explict_min_sparse = false;
+    bool bitmaps = false;
 
     ImgConvertState s = (ImgConvertState) {
         /* Need at least 4k of zeros for sparse detection */
@@ -2161,6 +2206,7 @@ static int img_convert(int argc, char **argv)
             {"target-image-opts", no_argument, 0, OPTION_TARGET_IMAGE_OPTS},
             {"salvage", no_argument, 0, OPTION_SALVAGE},
             {"target-is-zero", no_argument, 0, OPTION_TARGET_IS_ZERO},
+            {"bitmaps", no_argument, 0, OPTION_BITMAPS},
             {0, 0, 0, 0}
         };
         c = getopt_long(argc, argv, ":hf:O:B:Cco:l:S:pt:T:qnm:WU",
@@ -2286,6 +2332,9 @@ static int img_convert(int argc, char **argv)
              */
             s.has_zero_init = true;
             break;
+        case OPTION_BITMAPS:
+            bitmaps = true;
+            break;
         }
     }
 
@@ -2346,7 +2395,6 @@ static int img_convert(int argc, char **argv)
         error_report("Must specify image file name");
         goto fail_getopt;
     }
-
 
     /* ret is still -EINVAL until here */
     ret = bdrv_parse_cache_mode(src_cache, &src_flags, &src_writethrough);
@@ -2507,6 +2555,20 @@ static int img_convert(int argc, char **argv)
         }
     }
 
+    /* Determine if bitmaps need copying */
+    if (bitmaps) {
+        if (s.src_num > 1) {
+            error_report("Copying bitmaps only possible with single source");
+            ret = -1;
+            goto out;
+        }
+        if (!bdrv_supports_persistent_dirty_bitmap(blk_bs(s.src[0]))) {
+            error_report("Source lacks bitmap support");
+            ret = -1;
+            goto out;
+        }
+    }
+
     /*
      * The later open call will need any decryption secrets, and
      * bdrv_create() will purge "opts", so extract them now before
@@ -2515,9 +2577,7 @@ static int img_convert(int argc, char **argv)
     if (!skip_create) {
         open_opts = qdict_new();
         qemu_opt_foreach(opts, img_add_key_secrets, open_opts, &error_abort);
-    }
 
-    if (!skip_create) {
         /* Create the new image */
         ret = bdrv_create(drv, out_filename, opts, &local_err);
         if (ret < 0) {
@@ -2554,6 +2614,13 @@ static int img_convert(int argc, char **argv)
         goto out;
     }
     out_bs = blk_bs(s.target);
+
+    if (bitmaps && !bdrv_supports_persistent_dirty_bitmap(out_bs)) {
+        error_report("Format driver '%s' does not support bitmaps",
+                     out_bs->drv->format_name);
+        ret = -1;
+        goto out;
+    }
 
     if (s.compressed && !block_driver_can_compress(out_bs->drv)) {
         error_report("Compression not supported for this file format");
@@ -2610,10 +2677,15 @@ static int img_convert(int argc, char **argv)
     } else {
         s.compressed = s.compressed || bdi.needs_compressed_writes;
         s.cluster_sectors = bdi.cluster_size / BDRV_SECTOR_SIZE;
-        s.unallocated_blocks_are_zero = bdi.unallocated_blocks_are_zero;
     }
 
     ret = convert_do_copy(&s);
+
+    /* Now copy the bitmaps */
+    if (bitmaps && ret == 0) {
+        ret = convert_copy_bitmaps(blk_bs(s.src[0]), out_bs);
+    }
+
 out:
     if (!ret) {
         qemu_progress_print(100, 0);
@@ -3994,12 +4066,11 @@ static int print_amend_option_help(const char *format)
         return 1;
     }
 
-    /* Every driver supporting amendment must have create_opts */
-    assert(drv->create_opts);
+    /* Every driver supporting amendment must have amend_opts */
+    assert(drv->amend_opts);
 
-    printf("Creation options for '%s':\n", format);
-    qemu_opts_print_help(drv->create_opts, false);
-    printf("\nNote that not all of these options may be amendable.\n");
+    printf("Amend options for '%s':\n", format);
+    qemu_opts_print_help(drv->amend_opts, false);
     return 0;
 }
 
@@ -4008,7 +4079,7 @@ static int img_amend(int argc, char **argv)
     Error *err = NULL;
     int c, ret = 0;
     char *options = NULL;
-    QemuOptsList *create_opts = NULL;
+    QemuOptsList *amend_opts = NULL;
     QemuOpts *opts = NULL;
     const char *fmt = NULL, *filename, *cache;
     int flags;
@@ -4017,6 +4088,7 @@ static int img_amend(int argc, char **argv)
     BlockBackend *blk = NULL;
     BlockDriverState *bs = NULL;
     bool image_opts = false;
+    bool force = false;
 
     cache = BDRV_DEFAULT_CACHE;
     for (;;) {
@@ -4024,6 +4096,7 @@ static int img_amend(int argc, char **argv)
             {"help", no_argument, 0, 'h'},
             {"object", required_argument, 0, OPTION_OBJECT},
             {"image-opts", no_argument, 0, OPTION_IMAGE_OPTS},
+            {"force", no_argument, 0, OPTION_FORCE},
             {0, 0, 0, 0}
         };
         c = getopt_long(argc, argv, ":ho:f:t:pq",
@@ -4070,6 +4143,9 @@ static int img_amend(int argc, char **argv)
             break;
         case OPTION_IMAGE_OPTS:
             image_opts = true;
+            break;
+        case OPTION_FORCE:
+            force = true;
             break;
         }
     }
@@ -4134,13 +4210,28 @@ static int img_amend(int argc, char **argv)
         goto out;
     }
 
-    /* Every driver supporting amendment must have create_opts */
-    assert(bs->drv->create_opts);
+    /* Every driver supporting amendment must have amend_opts */
+    assert(bs->drv->amend_opts);
 
-    create_opts = qemu_opts_append(create_opts, bs->drv->create_opts);
-    opts = qemu_opts_create(create_opts, NULL, 0, &error_abort);
+    amend_opts = qemu_opts_append(amend_opts, bs->drv->amend_opts);
+    opts = qemu_opts_create(amend_opts, NULL, 0, &error_abort);
     qemu_opts_do_parse(opts, options, NULL, &err);
+
     if (err) {
+        /* Try to parse options using the create options */
+        Error *err1 = NULL;
+        amend_opts = qemu_opts_append(amend_opts, bs->drv->create_opts);
+        qemu_opts_del(opts);
+        opts = qemu_opts_create(amend_opts, NULL, 0, &error_abort);
+        qemu_opts_do_parse(opts, options, NULL, &err1);
+
+        if (!err1) {
+            error_append_hint(&err,
+                              "This option is only supported for image creation\n");
+        } else {
+            error_free(err1);
+        }
+
         error_report_err(err);
         ret = -1;
         goto out;
@@ -4148,7 +4239,7 @@ static int img_amend(int argc, char **argv)
 
     /* In case the driver does not call amend_status_cb() */
     qemu_progress_print(0.f, 0);
-    ret = bdrv_amend_options(bs, opts, &amend_status_cb, NULL, &err);
+    ret = bdrv_amend_options(bs, opts, &amend_status_cb, NULL, force, &err);
     qemu_progress_print(100.f, 0);
     if (ret < 0) {
         error_report_err(err);
@@ -4161,7 +4252,7 @@ out:
 out_no_progress:
     blk_unref(blk);
     qemu_opts_del(opts);
-    qemu_opts_free(create_opts);
+    qemu_opts_free(amend_opts);
     g_free(options);
 
     if (ret) {
@@ -4714,21 +4805,11 @@ static int img_bitmap(int argc, char **argv)
             qmp_block_dirty_bitmap_disable(bs->node_name, bitmap, &err);
             op = "disable";
             break;
-        case BITMAP_MERGE: {
-            BlockDirtyBitmapMergeSource *merge_src;
-            BlockDirtyBitmapMergeSourceList *list;
-
-            merge_src = g_new0(BlockDirtyBitmapMergeSource, 1);
-            merge_src->type = QTYPE_QDICT;
-            merge_src->u.external.node = g_strdup(src_bs->node_name);
-            merge_src->u.external.name = g_strdup(act->src);
-            list = g_new0(BlockDirtyBitmapMergeSourceList, 1);
-            list->value = merge_src;
-            qmp_block_dirty_bitmap_merge(bs->node_name, bitmap, list, &err);
-            qapi_free_BlockDirtyBitmapMergeSourceList(list);
+        case BITMAP_MERGE:
+            do_dirty_bitmap_merge(bs->node_name, bitmap, src_bs->node_name,
+                                  act->src, &err);
             op = "merge";
             break;
-        }
         default:
             g_assert_not_reached();
         }
@@ -5302,6 +5383,9 @@ static int img_measure(int argc, char **argv)
     if (output_format == OFORMAT_HUMAN) {
         printf("required size: %" PRIu64 "\n", info->required);
         printf("fully allocated size: %" PRIu64 "\n", info->fully_allocated);
+        if (info->has_bitmaps) {
+            printf("bitmaps size: %" PRIu64 "\n", info->bitmaps);
+        }
     } else {
         dump_json_block_measure_info(info);
     }

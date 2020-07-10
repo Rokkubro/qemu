@@ -297,6 +297,7 @@ static void mips_fuloong2e_init(MachineState *machine)
     long bios_size;
     uint8_t *spd_data;
     int64_t kernel_entry;
+    PCIDevice *pci_dev;
     PCIBus *pci_bus;
     ISABus *isa_bus;
     I2CBus *smbus;
@@ -367,10 +368,11 @@ static void mips_fuloong2e_init(MachineState *machine)
 
     /* GPU */
     if (vga_interface_type != VGA_NONE) {
-        dev = DEVICE(pci_create(pci_bus, -1, "ati-vga"));
+        pci_dev = pci_new(-1, "ati-vga");
+        dev = DEVICE(pci_dev);
         qdev_prop_set_uint32(dev, "vgamem_mb", 16);
         qdev_prop_set_uint16(dev, "x-device-id", 0x5159);
-        qdev_init_nofail(dev);
+        pci_realize_and_unref(pci_dev, pci_bus, &error_fatal);
     }
 
     /* Populate SPD eeprom data */
@@ -392,6 +394,7 @@ static void mips_fuloong2e_machine_init(MachineClass *mc)
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("Loongson-2E");
     mc->default_ram_size = 256 * MiB;
     mc->default_ram_id = "fuloong2e.ram";
+    mc->minimum_page_bits = 14;
 }
 
 DEFINE_MACHINE("fuloong2e", mips_fuloong2e_machine_init)
